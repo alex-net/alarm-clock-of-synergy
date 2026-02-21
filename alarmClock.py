@@ -1,8 +1,7 @@
-import sqlite3, re, datetime, json
+import sqlite3, re, datetime, json, subprocess, threading, time
 from prettytable import PrettyTable
 
 from dotenv import dotenv_values
-
 
 # читаем .env файлик
 env = dotenv_values()
@@ -50,8 +49,36 @@ class Alarm:
             raise ValueError('Будильник не найден')
         return cls(dict(zip(('id', 'time', 'cond'), row)))
 
+    @classmethod
+    def ringerAlarms(cls):
+        ''' Забрать будильники совпавшие с текущим временем'''
+        curTime = time.localtime()
+        ct = curTime.tm_hour * 60 + curTime.tm_min
+        dbCon2 = sqlite3.connect(env.get('dbFile', 'ac.db') )
+        cursor = dbCon2.cursor()
+        cursor.execute('select * from alarms where time = ?', (ct,))
+        alarms = cursor.fetchall()
+        cursor.close()
+        dbCon2.close()
+        return tuple(filter(lambda a: a.available(), map(lambda el: cls( dict(zip(('id', 'time', 'cond'), el))), alarms)))
+
+    def available(self):
+        ''' проверка условий '''
+        curTime = time.localtime()
+        # проверка по времени запуска... (первый запуск будильника)
+        if self._time != curTime.tm_hour * 60 + curTime.tm_min:
+            return False
+        # проверка даты если есть ...
+        if 'date' in self._cond and self._cond['date'] != f'{curTime.tm_mday:02d}.{curTime.tm_mon:02d}.{curTime.tm_year}':
+            return False
+        # вылет по дням недели...
+        if 'days' in self._cond and self.DAYS[curTime.tm_wday] not in self._cond['days']:
+            return False
+        return True
+
 
     def __init__(self, *args):
+        ''' Инициализация объекта будильника '''
         self._id = None
         # проверка на наличие в первом аргументе словаря - словарь - данные из базы
         if len(args) == 1 and isinstance(args[0], dict):
@@ -70,7 +97,6 @@ class Alarm:
 
     def __initFrom3Args(self, time='', when=None, repeat=None):
         ''' заполнение полей будильника из пользовательского ввода  '''
-
         time = re.match(r'^\d{2}:\d{2}$', time.strip())
         # Криво задано  время звонка ..
         if time is None:
@@ -81,9 +107,7 @@ class Alarm:
             raise TypeError('Выход за пределы интервалов указания времени')
         # Сохраняем время в минутах
         self._time = time[1] + time[0] * 60
-
         self._cond = {}
-
         # думаем, что задана дата
         if when and when != '-':
             v = re.match(r'^(\d{2})\.(\d{2})\.(\d{4})$', when.strip())
@@ -147,7 +171,7 @@ class Alarm:
         if 'count' in self._cond and self._cond['count'] > 0:
             res.append(f'{self._cond["count"]} п.')
         if 'interval' in self._cond:
-            res.append(f'через {self._cond["count"]} мин')
+            res.append(f'через {self._cond["interval"]} мин')
         return ' '.join(res) + ']'
 
 
@@ -159,8 +183,14 @@ class Alarm:
 
     @property
     def time(self):
-        ''' возвращаем время звонка'''
-        return f'{self._time // 60}:{self._time % 60}'
+        ''' возвращаем время звонка в виде строки'''
+        return  f'{self._time // 60:02d}:{self._time % 60:02d}'
+
+
+    @property
+    def timeAsDiget(self):
+        ''' возвращаем время звонка: минут в день'''
+        return self._time
 
 
     @property
@@ -170,18 +200,102 @@ class Alarm:
 
 
     @property
+    def repeatsTuple(self):
+        ''' число повторов в кортежа  '''
+        if 'count' in self._cond and 'interval' in self._cond:
+            return (self._cond['count'], self._cond['interval'],)
+        return None
+
+
+    @property
     def repeats(self):
-        ''' число повторов '''
+        ''' число повторов в виде строки '''
         if 'count' in self._cond and 'interval' in self._cond:
             return f'{self._cond['count']} через {self._cond['interval']} мин.'
         return '-'
 
 
+
 class AlarmClock:
     ''' Класс управления будильниками '''
+    __ringerAwailable = True
+
+    def __soundRinger(self):
+        ''' звонилка для будильника '''
+        # приложенеие для воспроизведения звука
+        playerApp = env.get('player', None)
+        soundTrack = env.get('sound', None)
+        try:
+            if playerApp and soundTrack:
+                subprocess.run([playerApp, soundTrack, '--volume=40'], timeout=30, stdout=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+    def __alarmRinger(self, sStart = None):
+        ''' проверяем состояния будильников .. '''
+        # просто счётчик
+        s = sStart if sStart else 0
+        # будильники с повтором
+        alarmsRepeat = {}
+        # сразу проверяем будильники ... вдруг кто всплыл
+        alarms = Alarm.ringerAlarms()
+        ''' звонилка для будильника . '''
+        while self.__ringerAwailable:
+            time.sleep(1)
+            # на  первой секунде каждой минуты ...
+            if s == 1:
+                curTime = time.localtime()
+                curTime = curTime.tm_hour*60 + curTime.tm_min
+                toDel = []
+                for aId in filter(lambda ark: curTime in alarmsRepeat[ark]['times'], alarmsRepeat):
+                    alarmDinger = threading.Thread(target=self.__soundRinger)
+                    alarmDinger.start()
+                    alarmsRepeat[aId]['times'].pop(0)
+                    # Повторы закончились ... пемечаем для удаления
+                    if len(alarmsRepeat[aId]['times']) == 0:
+                        toDel.append(aId)
+                for aId in toDel:
+                    del alarmsRepeat[aId]
+
+
+                # ищем будильники совпавшие по всем параметрам (певый звонок)
+                alarms = Alarm.ringerAlarms()
+                # по всем найденным - собираем повторы (если есть)
+                for alarm in alarms:
+                    reps = alarm.repeatsTuple
+                    # в будильнике есть повторы ..- нужно найти все повторы и сохранить для будущих запусков
+                    if reps:
+                        # на всякий пожарный запихаем сам будильник
+                        alarmsRepeat[alarm.id] = {'alarm': alarm, 'times': [alarm.timeAsDiget]}
+                        # собираем времена повторов
+                        for t in range(reps[0]):
+                            nt = alarmsRepeat[alarm.id]['times'][-1] + reps[1]
+                            # перенос через сутки
+                            nt = nt if nt < 24 * 60 else nt % (24 * 60)
+                            alarmsRepeat[alarm.id]['times'].append(nt)
+                        # выкинуть то что уже случилось
+                        alarmsRepeat[alarm.id]['times'].pop(0)
+                        # alarmsRepeat[alarm.id] = {'alarm': alarm, "c": reps[0], 'i': rep[1]}
+
+
+
+                # нашелся активный будильник - запускаем заонилку )
+                if len(alarms):
+                    alarmDinger = threading.Thread(target=self.__soundRinger)
+                    alarmDinger.start()
+            s += 1
+            if s > 59:
+                s = 0
+
     def __init__(self):
         ''' главный цикл приложения '''
         print('Для справки введите "help"\nвыход - пустая команда')
+        t = time.localtime();
+        # запуск ппотока опроса базы на наличие подходящих будильников
+        self.__ringer = threading.Thread(target=self.__alarmRinger, args= (t.tm_sec,))
+        self.__ringer.start()
+        # цикл опроса прользователя
         while True:
             cmd = input('Введите команду: ').strip()
             if not cmd:
@@ -197,6 +311,8 @@ class AlarmClock:
             except (TypeError, ValueError) as e:
                 print(f'Ошибка в параметрах: "{e}". Воспользуйтесь справкой "help"')
                 # raise e
+        self.__ringerAwailable = False
+        self.__ringer.join(timeout=2)
 
 
     def _todoHelp(self):
@@ -218,7 +334,7 @@ class AlarmClock:
     def _todoNewAlarm(self, time='', when=None, repeat=None):
         ''' установить новый будильник
             time - время чч:мм - обязательный
-            when - дата (дд.мм.гггг) или дени недели через запятую (вт,чт,сб). Если не указано - звонит кажды йдень.
+            when - дата (дд.мм.гггг) или дени недели через запятую (вт,чт,сб). Если не указано - звонит каждый день.
             repeat - повторы. формат: число:минуты, если пусто - звоним один раз'''
         # Если время не задали, надо спросить
         if not time:
