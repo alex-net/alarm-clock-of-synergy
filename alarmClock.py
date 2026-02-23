@@ -1,4 +1,5 @@
-import sqlite3, re, datetime, json, subprocess, threading, time
+import sqlite3, re, datetime, json, subprocess, threading, time, signal, os
+import tkinter.messagebox as msgBox
 from prettytable import PrettyTable
 
 from dotenv import dotenv_values
@@ -14,16 +15,18 @@ cursor.execute('''create table if not exists alarms (
     id integer,
     time integer  not null,
     cond text,
+    pid integet,
     constraint pk primary key (id autoincrement)
 );''')
 cursor.close()
-
 
 
 class Alarm:
     ''' Класс одного будильника '''
     # дни недели
     DAYS = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
+    # колонки загружаемые из таблицы будильников как отдельные поля
+    ALARM_COLUMNS = ('id', 'time', 'cond', 'pid', )
     # Наличие ошибок валидации
     __hasErrors = False
 
@@ -35,32 +38,57 @@ class Alarm:
         cursor.execute('select * from alarms')
         rows = cursor.fetchall()
         cursor.close()
-        return [cls(dict(zip(('id', 'time', 'cond'), row))) for row in rows]
+        return [cls(dict(zip(cls.ALARM_COLUMNS, row))) for row in rows]
 
 
     @classmethod
     def getById(cls, aId):
-        ''' загрузить будильник по id '''
+        ''' загрузить будильник по id
+            :param aId: Номер будильника в базе
+        '''
         cursor = dbCon.cursor()
         cursor.execute('select * from alarms where id = ?', (aId,))
         row = cursor.fetchone()
         cursor.close()
         if row is None:
             raise ValueError('Будильник не найден')
-        return cls(dict(zip(('id', 'time', 'cond'), row)))
+        return cls(dict(zip(cls.ALARM_COLUMNS, row)))
 
     @classmethod
-    def ringerAlarms(cls):
-        ''' Забрать будильники совпавшие с текущим временем'''
+    def ringerAlarms(cls, usedDbCon=None):
+        ''' Забрать будильники совпавшие с текущим временем
+            :param usedDbCon: используемое соединение для доступа к базе, Если пусто - используем соединение основного потока
+        '''
         curTime = time.localtime()
         ct = curTime.tm_hour * 60 + curTime.tm_min
-        dbCon2 = sqlite3.connect(env.get('dbFile', 'ac.db') )
+        dbCon2 = usedDbCon if usedDbCon else dbCon
         cursor = dbCon2.cursor()
         cursor.execute('select * from alarms where time = ?', (ct,))
         alarms = cursor.fetchall()
         cursor.close()
-        dbCon2.close()
+        # dbCon2.close()
         return tuple(filter(lambda a: a.available(), map(lambda el: cls( dict(zip(('id', 'time', 'cond'), el))), alarms)))
+
+
+    @classmethod
+    def stopAll(self, usedDbCon=None):
+        ''' Остановка всех запущенных будильников ..
+            :param usedDbCon: Используемое соединнение с базой
+        '''
+        dbCon2 = usedDbCon if usedDbCon else dbCon
+        curs = dbCon2.cursor()
+        curs.execute('select id as aid, pid from alarms where pid > 0')
+        pids = curs.fetchall()
+        if not pids:
+            return
+        for (aid, pid,) in pids:
+            try:
+                os.kill(pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            curs.execute('update alarms set pid = null where id = ?', (aid,))
+        dbCon2.commit()
+
 
     def available(self):
         ''' проверка условий '''
@@ -79,7 +107,8 @@ class Alarm:
 
     def __init__(self, *args):
         ''' Инициализация объекта будильника '''
-        self._id = None
+        self._id = None # номер будильника
+        self._pid = None # номер приложения-звонилки ....
         # проверка на наличие в первом аргументе словаря - словарь - данные из базы
         if len(args) == 1 and isinstance(args[0], dict):
             for k in args[0].keys():
@@ -87,7 +116,7 @@ class Alarm:
             return
 
         # создание нового объекта из исходных данных
-        if len(args) == 3:
+        if len(args) == 4:
             try:
                 self.__initFrom3Args(*args)
             except BaseException as e:
@@ -95,7 +124,7 @@ class Alarm:
                 raise e
 
 
-    def __initFrom3Args(self, time='', when=None, repeat=None):
+    def __initFrom3Args(self, time='', when=None, repeat=None, msg=None):
         ''' заполнение полей будильника из пользовательского ввода  '''
         time = re.match(r'^\d{2}:\d{2}$', time.strip())
         # Криво задано  время звонка ..
@@ -133,6 +162,9 @@ class Alarm:
                 raise ValueError('Слишком длинные повторы')
             self._cond.update(repeat)
 
+        if msg:
+            self._cond['msg'] = msg
+
 
     def save(self):
         ''' сохранение будильника'''
@@ -153,10 +185,56 @@ class Alarm:
         # Нельзя удалить то чего ещё нет
         if not self._id:
             return False
+        self.stopDing()
         cursor = dbCon.cursor()
         cursor.execute('delete from alarms where id = ?', (self._id,))
         dbCon.commit()
         cursor.close()
+        return True
+
+
+    def __showMsg(self):
+        ''' Показываем сообщение '''
+        msgBox.showinfo(self, self._cond['msg'] if 'msg' in self._cond and self._cond['msg'] else  'Звоним!')
+
+    def startDing(self, dbThreadCon=None):
+        ''' запуск звонилки .. .для конкретного будильника
+            :param dbThreadCon: Используемое соединение с базой, если пусто - используем основной поток
+        '''
+        dbCon2 = dbThreadCon if dbThreadCon else dbCon
+        if self._pid: # будильник уже звонил на момент повтора  - надо остановить и сделать перезапуск
+            self.stopDing(dbCon2)
+
+        # print('ding', self._id, '!!')
+
+        playerApp = env.get('player', None)
+        soundTrack = env.get('sound', None)
+        if playerApp and soundTrack:
+            proc = subprocess.Popen([playerApp, soundTrack, '--volume=30'], stdout=subprocess.DEVNULL)
+            self._pid = proc.pid
+            curs = dbCon2.cursor()
+            curs.execute('update alarms set pid = ? where id = ?', (self._pid, self._id,))
+            dbCon2.commit()
+            curs.close()
+            # показываем сообщение ...
+            threading.Thread(target=self.__showMsg).start()
+
+    def stopDing(self, dbThreadCon=None):
+        ''' остановка запущенного будильника
+            :param dbThreadCon: соединение с базой используемое в потоке
+        '''
+        if self._pid is None:
+            return False
+
+        try:
+            os.kill(self._pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        dbCon2 = dbThreadCon if dbThreadCon else dbCon
+        curs = dbCon2.cursor()
+        curs.execute('update alarms set pid = null where id = ?', (self._id,))
+        dbCon2.commit()
+        curs.close()
         return True
 
 
@@ -206,6 +284,10 @@ class Alarm:
             return (self._cond['count'], self._cond['interval'],)
         return None
 
+    @property
+    def isRing(self):
+        ''' будильник в активном режиме - звонит '''
+        return self._pid is not None
 
     @property
     def repeats(self):
@@ -218,82 +300,101 @@ class Alarm:
 
 class AlarmClock:
     ''' Класс управления будильниками '''
-    __ringerAwailable = True
 
-    def __soundRinger(self):
-        ''' звонилка для будильника '''
-        # приложенеие для воспроизведения звука
-        playerApp = env.get('player', None)
-        soundTrack = env.get('sound', None)
-        try:
-            if playerApp and soundTrack:
-                subprocess.run([playerApp, soundTrack, '--volume=40'], timeout=30, stdout=subprocess.DEVNULL)
-        except subprocess.TimeoutExpired:
-            pass
+    # проверка будильников работает до тех пор пока тут True
+    __ringerAwailable = True
+    # Набор будильников с повторами ... (их нужно повторить )
+    __alarmsWithRepeat = {}
+    # содинение базы для потока проверяющего и запускающего будильники ..
+    __dbConnectionAlarmsCheckerThread = None
+
+
+    def __alarmRingerRepeatTodo(self):
+        ''' проверка и запуск повторов будильников  '''
+        curTime = time.localtime()
+        curTime = curTime.tm_hour*60 + curTime.tm_min
+        toDel = []
+        # пробегаем по повторам ..
+        for aId in filter(lambda ark: curTime in self.__alarmsWithRepeat[ark]['times'], self.__alarmsWithRepeat):
+            self.__alarmsWithRepeat[aId]['alarm'].startDing(self.__dbConnectionAlarmsCheckerThread)
+            self.__alarmsWithRepeat[aId]['times'].pop(0)
+            # Повторы закончились ... пемечаем для удаления
+            if len(self.__alarmsWithRepeat[aId]['times']) == 0:
+                toDel.append(aId)
+        for aId in toDel:
+            del self.__alarmsWithRepeat[aId]
+
+
+    def __alarmRingerFirstRinger(self, alarm):
+        ''' заполнение повторов - первый запуск будильника
+            :param alarm: объект запущенного будильника
+        '''
+        # Включаем звонилку ...
+        alarm.startDing(self.__dbConnectionAlarmsCheckerThread)
+        # alarmDinger = threading.Thread(target=self.__soundRinger)
+        #     alarmDinger.start()
+
+        # Запрос повторов у будильника
+        reps = alarm.repeatsTuple
+        # нет повторов
+        if not reps:
+            return
+
+        # на всякий пожарный запихаем сам будильник
+        self.__alarmsWithRepeat[alarm.id] = {'alarm': alarm, 'times': [alarm.timeAsDiget]}
+        # собираем времена повторов
+        for t in range(reps[0]):
+            nt = self.__alarmsWithRepeat[alarm.id]['times'][-1] + reps[1]
+            # перенос через сутки
+            nt = nt if nt < 24 * 60 else nt % (24 * 60)
+            self.__alarmsWithRepeat[alarm.id]['times'].append(nt)
+        # выкинуть то что уже случилось
+        self.__alarmsWithRepeat[alarm.id]['times'].pop(0)
 
 
     def __alarmRinger(self, sStart = None):
-        ''' проверяем состояния будильников .. '''
+        ''' проверяем состояния будильников ..
+            :param sStart: Секунда реального времени на которой был запуск
+        '''
+        self.__dbConnectionAlarmsCheckerThread = sqlite3.connect(env.get('dbFile', 'ac.db'))
         # просто счётчик
         s = sStart if sStart else 0
         # будильники с повтором
-        alarmsRepeat = {}
+        self.__alarmsWithRepeat = {}
         # сразу проверяем будильники ... вдруг кто всплыл
-        alarms = Alarm.ringerAlarms()
+        alarms = Alarm.ringerAlarms(self.__dbConnectionAlarmsCheckerThread)
+        # по всем найденным - собираем повторы (если есть)
+        for alarm in alarms:
+            self.__alarmRingerFirstRinger(alarm)
+
         ''' звонилка для будильника . '''
         while self.__ringerAwailable:
             time.sleep(1)
             # на  первой секунде каждой минуты ...
             if s == 1:
-                curTime = time.localtime()
-                curTime = curTime.tm_hour*60 + curTime.tm_min
-                toDel = []
-                for aId in filter(lambda ark: curTime in alarmsRepeat[ark]['times'], alarmsRepeat):
-                    alarmDinger = threading.Thread(target=self.__soundRinger)
-                    alarmDinger.start()
-                    alarmsRepeat[aId]['times'].pop(0)
-                    # Повторы закончились ... пемечаем для удаления
-                    if len(alarmsRepeat[aId]['times']) == 0:
-                        toDel.append(aId)
-                for aId in toDel:
-                    del alarmsRepeat[aId]
-
+                self.__alarmRingerRepeatTodo()
 
                 # ищем будильники совпавшие по всем параметрам (певый звонок)
-                alarms = Alarm.ringerAlarms()
+                alarms = Alarm.ringerAlarms(self.__dbConnectionAlarmsCheckerThread)
                 # по всем найденным - собираем повторы (если есть)
                 for alarm in alarms:
-                    reps = alarm.repeatsTuple
-                    # в будильнике есть повторы ..- нужно найти все повторы и сохранить для будущих запусков
-                    if reps:
-                        # на всякий пожарный запихаем сам будильник
-                        alarmsRepeat[alarm.id] = {'alarm': alarm, 'times': [alarm.timeAsDiget]}
-                        # собираем времена повторов
-                        for t in range(reps[0]):
-                            nt = alarmsRepeat[alarm.id]['times'][-1] + reps[1]
-                            # перенос через сутки
-                            nt = nt if nt < 24 * 60 else nt % (24 * 60)
-                            alarmsRepeat[alarm.id]['times'].append(nt)
-                        # выкинуть то что уже случилось
-                        alarmsRepeat[alarm.id]['times'].pop(0)
-                        # alarmsRepeat[alarm.id] = {'alarm': alarm, "c": reps[0], 'i': rep[1]}
-
-
-
-                # нашелся активный будильник - запускаем заонилку )
-                if len(alarms):
-                    alarmDinger = threading.Thread(target=self.__soundRinger)
-                    alarmDinger.start()
+                    self.__alarmRingerFirstRinger(alarm)
             s += 1
             if s > 59:
                 s = 0
+
+        # Остановка запущенных будильников ...
+        Alarm.stopAll(self.__dbConnectionAlarmsCheckerThread)
+        # signal.SIGTERM
+        self.__dbConnectionAlarmsCheckerThread.close()
+
 
     def __init__(self):
         ''' главный цикл приложения '''
         print('Для справки введите "help"\nвыход - пустая команда')
         t = time.localtime();
-        # запуск ппотока опроса базы на наличие подходящих будильников
-        self.__ringer = threading.Thread(target=self.__alarmRinger, args= (t.tm_sec,))
+        # запуск потока опроса базы на наличие подходящих будильников
+        self.__ringer = threading.Thread(target = self.__alarmRinger, args = (t.tm_sec,))
         self.__ringer.start()
         # цикл опроса прользователя
         while True:
@@ -348,7 +449,9 @@ class AlarmClock:
         if not repeat:
             repeat = input('Введите интервал число повторов в формате N:M - N раз чеез M минут (пустая строка - без повторов): ').strip()
 
-        alarm = Alarm(time, when, repeat)
+        alaemMessage = input('Введите сообщение для будильника. Пустая строка - стандартное сообщение: ').strip()
+
+        alarm = Alarm(time, when, repeat, alaemMessage)
         if alarm.save():
             print(f'Будильник {alarm} успешно добавлен')
 
@@ -360,14 +463,25 @@ class AlarmClock:
         tbl.title= 'Список будильников'
         tbl.field_names = ['#', 'ID', 'Время', 'Условие', 'Повторы']
         for (i, alarm) in enumerate(alarms):
-            tbl.add_row([i + 1, alarm.id, alarm.time, alarm.when, alarm.repeats])
+            tbl.add_row([i + 1, f"{'*' if alarm.isRing else ' '}{alarm.id}", alarm.time, alarm.when, alarm.repeats])
         print(tbl)
 
 
+    def __getAlarmPerId(self, msg, aId=None):
+        if aId is None:
+            aId = input(msg).strip()
+        return Alarm.getById(aId)
+
+
+    def _todoStop(self, aId=None):
+        ''' Остановка конкретного будильника '''
+        alarm = self.__getAlarmPerId('Введите id будильника для остановки: ', aId)
+
+        if alarm.stopDing():
+            print(f'Будильник {alarm} остановлен')
+
     def _todoDelete(self, aId=None):
         ''' Удаление будильника по id'''
-        if aId is None:
-            aId = input('Введите id будильника для удаления: ').strip()
-        alarm = Alarm.getById(aId)
+        alarm = self.__getAlarmPerId('Введите id будильника для удаления: ', aId)
         if alarm.delete():
             print(f'Будильник {alarm} удалён')
