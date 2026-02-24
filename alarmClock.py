@@ -20,6 +20,14 @@ cursor.execute('''create table if not exists alarms (
 );''')
 cursor.close()
 
+soundDir = env.get('soundDir', None)
+
+# Список, того что можно поиграть ....
+soundFiles = []
+
+if soundDir and os.path.exists(soundDir):
+    soundFiles = [sItem for sItem in os.scandir(soundDir) if sItem.is_file()]
+
 
 class Alarm:
     ''' Класс одного будильника '''
@@ -116,7 +124,7 @@ class Alarm:
             return
 
         # создание нового объекта из исходных данных
-        if len(args) == 4:
+        if len(args) == 5:
             try:
                 self.__initFrom3Args(*args)
             except BaseException as e:
@@ -124,7 +132,7 @@ class Alarm:
                 raise e
 
 
-    def __initFrom3Args(self, time='', when=None, repeat=None, msg=None):
+    def __initFrom3Args(self, time='', when=None, repeat=None, msg=None, soundNum=None):
         ''' заполнение полей будильника из пользовательского ввода  '''
         time = re.match(r'^\d{2}:\d{2}$', time.strip())
         # Криво задано  время звонка ..
@@ -153,6 +161,7 @@ class Alarm:
                 self._cond['date'] = v.group(0)
             else:
                 self._cond['days'] = v
+        # повторы
         if repeat and repeat != '-':
             r = re.match(r'^(\d+):(\d+)$', repeat)
             if r is None:
@@ -162,8 +171,15 @@ class Alarm:
                 raise ValueError('Слишком длинные повторы')
             self._cond.update(repeat)
 
+        # сообщение
         if msg:
             self._cond['msg'] = msg
+
+        # мелодия
+        if soundNum and soundNum.isdigit():
+            soundNum = int(soundNum) - 1
+            if soundNum >= 0 and soundNum < len(soundFiles):
+                self._cond['soundN'] = soundNum
 
 
     def save(self):
@@ -209,6 +225,9 @@ class Alarm:
 
         playerApp = env.get('player', None)
         soundTrack = env.get('sound', None)
+        if 'soundN' in self._cond and self._cond['soundN'] >= 0 and self._cond['soundN'] < len(soundFiles):
+            soundTrack = soundFiles[self._cond['soundN']].path
+
         if playerApp and soundTrack:
             proc = subprocess.Popen([playerApp, soundTrack, '--volume=30'], stdout=subprocess.DEVNULL)
             self._pid = proc.pid
@@ -451,7 +470,16 @@ class AlarmClock:
 
         alaemMessage = input('Введите сообщение для будильника. Пустая строка - стандартное сообщение: ').strip()
 
-        alarm = Alarm(time, when, repeat, alaemMessage)
+        tbl = PrettyTable()
+        tbl.title= 'Список мелодий'
+        tbl.field_names = ['#', 'Наименование']
+        for (i, sItem) in enumerate(soundFiles):
+            tbl.add_row([i + 1, sItem.name])
+        print(tbl)
+        soundNum = input('Укажите мелодию звонка (пустая строка - звучит стандартная мелодия): ').strip()
+
+
+        alarm = Alarm(time, when, repeat, alaemMessage, soundNum)
         if alarm.save():
             print(f'Будильник {alarm} успешно добавлен')
 
